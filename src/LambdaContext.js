@@ -1,38 +1,41 @@
 'use strict';
 
-const { createUniqueId } = require('./utils/index.js');
+const EventEmitter = require('events');
 
-// https://docs.aws.amazon.com/lambda/latest/dg/limits.html
-// default function timeout in seconds
-const DEFAULT_TIMEOUT = 900; // 15 min
-
-// Mimicks the lambda context object
+// class for creating a LambdaContext
 // http://docs.aws.amazon.com/lambda/latest/dg/nodejs-prog-model-context.html
-module.exports = class LambdaContext {
-  constructor(options) {
+module.exports = class LambdaContext extends EventEmitter {
+  constructor(config) {
+    super();
+
+    this._config = config;
+  }
+
+  _callback(err, data) {
+    this.emit('contextCalled', err, data);
+  }
+
+  // returns a new Context instance
+  getContext() {
     const {
-      callback,
+      awsRequestId,
+      getRemainingTimeInMillis,
       lambdaName,
       memorySize,
-      timeout = DEFAULT_TIMEOUT,
-    } = options;
-
-    const endTime = new Date().getTime() + timeout * 1000;
+    } = this._config;
 
     return {
       // doc-deprecated methods
-      done: callback,
-      fail: (err) => callback(err, null),
-      succeed: (res) => callback(null, res),
+      done: (err, data) => this._callback(err, data),
+      fail: (err) => this._callback(err),
+      succeed: (res) => this._callback(null, res),
 
-      // methods
+      // functions
       // NOTE: the AWS context methods are OWN FUNCTIONS (NOT on the prototype!)
-      getRemainingTimeInMillis() {
-        return endTime - new Date().getTime();
-      },
+      getRemainingTimeInMillis,
 
       // properties
-      awsRequestId: `offline_awsRequestId_${createUniqueId()}`,
+      awsRequestId,
       clientContext: {},
       functionName: lambdaName,
       functionVersion: `offline_functionVersion_for_${lambdaName}`,

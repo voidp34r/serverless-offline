@@ -2,7 +2,6 @@
 
 const { readFileSync } = require('fs');
 const path = require('path');
-const { performance, PerformanceObserver } = require('perf_hooks');
 const h2o2 = require('@hapi/h2o2');
 const { Server } = require('@hapi/hapi');
 const authFunctionNameExtractor = require('./authFunctionNameExtractor.js');
@@ -10,9 +9,8 @@ const createAuthScheme = require('./createAuthScheme.js');
 const createVelocityContext = require('./createVelocityContext.js');
 const debugLog = require('./debugLog.js');
 const Endpoint = require('./Endpoint.js');
-const functionHelper = require('./functionHelper.js');
 const jsonPath = require('./jsonPath.js');
-const LambdaContext = require('./LambdaContext.js');
+const LambdaFunction = require('./LambdaFunction.js');
 const LambdaProxyEvent = require('./LambdaProxyEvent.js');
 const parseResources = require('./parseResources.js');
 const renderVelocityTemplateObject = require('./renderVelocityTemplateObject.js');
@@ -335,11 +333,13 @@ module.exports = class ApiGateway {
       };
     }
 
+    const lambdaFunction = new LambdaFunction(funOptions, this.options);
+
     this.server.route({
       config: routeConfig,
       method: routeMethod,
       path: fullPath,
-      handler: (request, h) => {
+      handler: async (request, h) => {
         // Here we go
         // Store current request as the last one
         this.lastRequestOptions = {
@@ -371,14 +371,17 @@ module.exports = class ApiGateway {
 
         // Normal usage
         if (headersArray) {
-          request.unprocessedHeaders = {};
           request.multiValueHeaders = {};
+          request.unprocessedHeaders = {};
 
           for (let i = 0; i < headersArray.length; i += 2) {
-            request.unprocessedHeaders[headersArray[i]] = headersArray[i + 1];
-            request.multiValueHeaders[headersArray[i]] = (
-              request.multiValueHeaders[headersArray[i]] || []
-            ).concat(headersArray[i + 1]);
+            const key = headersArray[i];
+            const value = headersArray[i + 1];
+
+            request.unprocessedHeaders[key] = value;
+            request.multiValueHeaders[key] = (
+              request.multiValueHeaders[key] || []
+            ).concat(value);
           }
         }
         // Lib testing
@@ -403,8 +406,9 @@ module.exports = class ApiGateway {
               .type('application/json')
               .header('x-amzn-ErrorType', 'ForbiddenException');
 
-          if ('x-api-key' in request.headers) {
-            const requestToken = request.headers['x-api-key'];
+          const requestToken = request.headers['x-api-key'];
+
+          if (requestToken) {
             if (requestToken !== this.options.apiKey) {
               debugLog(
                 `Method ${method} of function ${functionName} token ${requestToken} not valid`,
@@ -415,7 +419,7 @@ module.exports = class ApiGateway {
           } else if (
             request.auth &&
             request.auth.credentials &&
-            'usageIdentifierKey' in request.auth.credentials
+            request.auth.credentials.usageIdentifierKey
           ) {
             const { usageIdentifierKey } = request.auth.credentials;
 
@@ -475,7 +479,6 @@ module.exports = class ApiGateway {
 
         /* HANDLER LAZY LOADING */
 
-        let userHandler; // The lambda function
         Object.assign(process.env, this.originalEnvironment);
 
         try {
@@ -498,8 +501,8 @@ module.exports = class ApiGateway {
               this.service.functions[functionName].environment,
             );
           }
+
           process.env._HANDLER = functionObj.handler;
-          userHandler = functionHelper.createHandler(funOptions, this.options);
         } catch (err) {
           return this._reply500(
             response,
@@ -553,6 +556,7 @@ module.exports = class ApiGateway {
         }
 
         debugLog('event:', event);
+        lambdaFunction.addEvent(event);
 
         const processResponse = (err, data) => {
           // Everything in this block happens once the lambda function has resolved
@@ -605,12 +609,10 @@ module.exports = class ApiGateway {
               console.error(err.stack);
             }
 
-            for (const key in endpoint.responses) {
+            for (const [key, value] of Object.entries(endpoint.responses)) {
               if (
                 key !== 'default' &&
-                errorMessage.match(
-                  `^${endpoint.responses[key].selectionPattern || key}$`,
-                )
+                errorMessage.match(`^${value.selectionPattern || key}$`)
               ) {
                 responseName = key;
                 break;
@@ -872,69 +874,20 @@ module.exports = class ApiGateway {
           return response;
         };
 
-        return new Promise(async (resolve) => {
-          const callback = (err, data) => {
-            if (this.options.showDuration) {
-              performance.mark(`${requestId}-end`);
-              performance.measure(
-                functionName,
-                `${requestId}-start`,
-                `${requestId}-end`,
-              );
-            }
+        let result;
 
-            resolve(processResponse(err, data));
-          };
+        try {
+          result = await lambdaFunction.runHandler();
 
-          const lambdaContext = new LambdaContext({
-            callback,
-            lambdaName: functionObj.name,
-            memorySize:
-              functionObj.memorySize || this.service.provider.memorySize,
-            timeout: functionObj.timeout || this.service.provider.timeout,
-          });
+          const executionTime = lambdaFunction.getExecutionTimeInMillis();
+          this.log(
+            `Duration ${executionTime.toFixed(2)} ms (λ: ${functionName})`,
+          );
 
-          if (this.options.showDuration) {
-            performance.mark(`${requestId}-start`);
-
-            const obs = new PerformanceObserver((list) => {
-              for (const { duration, name } of list.getEntries()) {
-                this.log(`Duration ${duration.toFixed(2)} ms (λ: ${name})`);
-              }
-
-              obs.disconnect();
-            });
-
-            obs.observe({ entryTypes: ['measure'] });
-          }
-
-          let result;
-
-          try {
-            debugLog('_____ CALLING HANDLER _____');
-            result = userHandler(event, lambdaContext, callback);
-
-            // Promise
-            if (result && typeof result.then === 'function') {
-              try {
-                const data = await result;
-                callback(null, data);
-              } catch (err) {
-                callback(err, null);
-              }
-            } else if (result instanceof Error) {
-              callback(result, null);
-            }
-          } catch (error) {
-            return resolve(
-              this._reply500(
-                response,
-                `Uncaught error in your '${functionName}' handler`,
-                error,
-              ),
-            );
-          }
-        });
+          return processResponse(null, result);
+        } catch (err) {
+          return processResponse(err);
+        }
       },
     });
   }
